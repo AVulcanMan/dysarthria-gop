@@ -19,6 +19,18 @@ from model import Wav2Vec2Recognizer, Wav2Vec2ConvRecognizer
 from loss import get_loss
 
 
+def _str2bool(v):
+    # argparse's type=bool is broken for CLI flags: bool("False") == True since any
+    # non-empty string is truthy. This helper parses common textual boolean forms instead.
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ("yes", "true", "t", "y", "1"):
+        return True
+    if v.lower() in ("no", "false", "f", "n", "0"):
+        return False
+    raise argparse.ArgumentTypeError(f"Boolean value expected, got {v!r}")
+
+
 def _get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--exp_name", type=str)
@@ -32,7 +44,7 @@ def _get_args():
 
     # Model Settings
     parser.add_argument("--model", default="facebook/wav2vec2-xls-r-300m", type=str)
-    parser.add_argument("--use_conv_only", default=True, type=bool)
+    parser.add_argument("--use_conv_only", default=True, type=_str2bool)
 
     # Optimizer Settings
     parser.add_argument("--optim", default="AdamW", type=str)
@@ -40,7 +52,7 @@ def _get_args():
 
     # Dataset settings
     parser.add_argument("--commonphone_csv", required=True, type=Path)
-    parser.add_argument("--reduce_vocab", default=False, type=bool)
+    parser.add_argument("--reduce_vocab", default=False, type=_str2bool)
 
     return parser.parse_args()
 
@@ -64,6 +76,9 @@ def _get_logger(tb_path):
 def _get_collator(model, vocab_to_index, _get_feat_extract_output_lengths):
     processor = Wav2Vec2FeatureExtractor.from_pretrained(model)
     def _collate(batch):
+        # Record each sample's true (unpadded) waveform length before the processor
+        # pads audios with zeros, so we can later derive the true feature length.
+        raw_lengths = [len(b[0]) for b in batch]
         audios = [b[0] for b in batch]
         audios = processor(raw_speech=audios, sampling_rate=16000, padding=True)
         audios = torch.FloatTensor(audios["input_values"])
@@ -73,7 +88,11 @@ def _get_collator(model, vocab_to_index, _get_feat_extract_output_lengths):
 
         labels = np.ones((batch_size, max_feature_length), dtype=np.int32) * -100
         for i, (_, _df) in enumerate(batch):
-            feature_length = (audios[i] != -100).sum().item()
+            # The old code compared padded audio samples to the -100 label sentinel, but
+            # padding uses 0.0 and this conflates waveform samples with feature frames.
+            # Instead, derive the true feature length from the true (unpadded) raw waveform
+            # length, clamped to max_feature_length so padded frames stay -100 (ignored).
+            feature_length = min(_get_feat_extract_output_lengths(raw_lengths[i]).item(), max_feature_length)
             labels[i, 0:feature_length] = vocab_to_index["(...)"]
 
             for _, row in _df.iterrows():

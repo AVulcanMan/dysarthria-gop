@@ -2,27 +2,33 @@ import torch
 import torch.nn.functional as F
 
 
-def _get_losses_lengths(logits, labels):
-    probs = F.softmax(logits.transpose(1, 2), dim=1)
+def _get_losses_lengths(logits, labels, log: bool = True):
+    # F.nll_loss expects LOG-probabilities as input. Passing plain softmax
+    # probabilities (log=False) silently reproduces the old (incorrect) loss;
+    # log=True (default) uses log_softmax, which is the mathematically correct fix.
+    if log:
+        probs = F.log_softmax(logits.transpose(1, 2), dim=1)
+    else:
+        probs = F.softmax(logits.transpose(1, 2), dim=1)
     losses = F.nll_loss(probs, labels, ignore_index=-100, reduction="none")
     lengths = (labels >= 0).sum(1)
     return losses, lengths
 
 
-def samplewise_average_loss(logits, labels):
-    losses, lengths = _get_losses_lengths(logits, labels)
+def samplewise_average_loss(logits, labels, log: bool = True):
+    losses, lengths = _get_losses_lengths(logits, labels, log=log)
     weights = (1/lengths)[:, None].expand(labels.shape) / len(labels)
     return (losses * weights).sum()
 
 
-def phonewise_average_loss(logits, labels):
-    losses, lengths = _get_losses_lengths(logits, labels)
+def phonewise_average_loss(logits, labels, log: bool = True):
+    losses, lengths = _get_losses_lengths(logits, labels, log=log)
     weights = 1 / lengths.sum()
     return (losses * weights).sum()
 
 
-def ctc_like_loss(logits, labels):
-    losses, lengths = _get_losses_lengths(logits, labels)
+def ctc_like_loss(logits, labels, log: bool = True):
+    losses, lengths = _get_losses_lengths(logits, labels, log=log)
     weights = []
     for label, length in zip(labels, lengths):
         label = label[:length]

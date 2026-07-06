@@ -33,7 +33,11 @@ class Wav2Vec2Recognizer(BaseRecognizer):
         self.net.freeze_feature_encoder()
 
     def _get_features(self, inputs):
-        outputs = self.net(inputs)
+        # argon_gpu full-transformer patch: self.net(inputs)[0] returns projected_states
+        # (768-d), which mismatches the 1024-d head built for this model. Use
+        # self.net.wav2vec2(inputs)[0] instead, which is the last_hidden_state (1024-d)
+        # of the underlying wav2vec2 transformer.
+        outputs = self.net.wav2vec2(inputs)
         return outputs[0]
 
 

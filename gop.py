@@ -1,5 +1,6 @@
 import argparse
 import pickle
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -10,7 +11,7 @@ from tqdm import tqdm
 
 from dataset import PhoneRecognitionDataset, reduce_vocab
 from model import Wav2Vec2Recognizer, Wav2Vec2ConvRecognizer
-from train_phone_recognizer import _get_collator
+from train_phone_recognizer import _get_collator, _str2bool
 
 
 def _get_args():
@@ -19,7 +20,13 @@ def _get_args():
     parser.add_argument("--commonphone_csv", type=Path)
     parser.add_argument("--gpu", default=None, type=int, help="Default to CPU. Input GPU index (integer) to use GPU.")
     parser.add_argument("--model_path", type=Path)
-    parser.add_argument("--ignore_nonexisting_vocab", type=bool, default=False)
+    # bool(...) on a non-empty string is always True (e.g. bool("False") == True), so a plain
+    # type=bool would make "--ignore_nonexisting_vocab False" behave as True. Use _str2bool instead.
+    parser.add_argument("--ignore_nonexisting_vocab", type=_str2bool, default=False)
+    # temperature must be re-fit per model checkpoint using temperature_scaling.py;
+    # 7.8375 is only the value fit for the original reference model.
+    parser.add_argument("--temperature", type=float, default=7.8375,
+                         help="Temperature for scaled GoP scorers. Must be re-fit per model via temperature_scaling.py.")
     return parser.parse_args()
 
 
@@ -142,16 +149,23 @@ def mean_prob_gop_scorer(logits, labels, ignore_label):
 
 
 def entropy_gop_scorer(logits, labels, ignore_label):
+    # Per-phone predictive entropy H = -sum(p * log(p)) of the mean softmax distribution
+    # over that phone's frames. Entropy measures uncertainty, so higher = worse (opposite
+    # convention from the other GoP scorers, where higher = better); callers doing
+    # comparative analysis with the other scorers may want to negate this.
     scores = []
     preds = logits.softmax(-1)
     for vocab, mask in _phonewise_loop(labels, ignore_label):
-        scores.append(preds[mask, vocab].mean().item())
-    return entropy(scores)
+        mean_preds = preds[mask].mean(0).numpy()
+        scores.append(entropy(mean_preds))
+    return np.array(scores)
 
 
 def normalizer(scorer, prior):
     def _norm_scorer(logits, labels, ignore_label):
-        return scorer(logits - np.exp(prior), labels, ignore_label)
+        # Prior-normalized GoP subtracts the LOG-prior (not exp(prior)) from the logits;
+        # the eps guards against log(0) for phones absent from the prior distribution.
+        return scorer(logits - np.log(prior + 1e-12), labels, ignore_label)
     return _norm_scorer
 
 
@@ -180,7 +194,20 @@ if __name__ == "__main__":
     if do_reduce_vocab:
         cp_df = reduce_vocab(cp_df)
     prior = _get_prior(cp_df, vocab_to_index)
-    temperature = 7.8375
+
+    # Phones in the model's vocab that have zero coverage in the prior CSV get a prior of 0,
+    # which the prior-normalized scorers now handle via the log(prior + eps) guard (see
+    # `normalizer`). This is tolerable but worth surfacing, so warn rather than abort.
+    missing_phones = [vocab for vocab, idx in vocab_to_index.items() if prior[idx] == 0]
+    if missing_phones:
+        print(
+            f"WARNING: {len(missing_phones)} model-vocab phone(s) absent from the prior "
+            f"(commonphone_csv train split); their prior is 0 (eps-guarded in Norm*/DNN scorers): "
+            f"{missing_phones}",
+            file=sys.stderr,
+        )
+
+    temperature = args.temperature
 
     logits_acc, labels_acc = _infer(model.to(device), test_dl, device)
     if args.ignore_nonexisting_vocab:
